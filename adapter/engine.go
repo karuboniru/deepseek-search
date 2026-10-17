@@ -7,13 +7,24 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 )
 
 const searchFunction = "__deepseek_web_search"
 
-// Model makes one non-streaming Responses request to the upstream model.
+// Model returns one complete Responses object from the upstream model.
+// Its transport may stream while collecting that object.
 type Model func(context.Context, []byte) ([]byte, error)
+
+// Observer receives public response progress synchronously. Returning an error
+// aborts the request. Search indexes refer to the final public output array.
+// Each search emits in_progress before execution and completed or failed afterward.
+type Observer interface {
+	Start(response json.RawMessage) error
+	Search(index int, item json.RawMessage) error
+}
 
 // Searcher supplies search results and fetched pages as JSON values.
 type Searcher interface {
@@ -35,6 +46,13 @@ func NewEngine(searcher Searcher, opts Options) *Engine {
 // Run processes one public Responses request. The tenant key must identify the
 // authenticated caller; a response ID alone never authorizes access to history.
 func (e *Engine) Run(ctx context.Context, tenant string, body []byte, model Model) ([]byte, error) {
+	return e.RunObserved(ctx, tenant, body, model, nil)
+}
+
+// RunObserved processes a request while reporting public search progress. Start
+// runs after request validation and before any upstream call, including requests
+// that pause for outstanding client tools. Its ID is reused by the final response.
+func (e *Engine) RunObserved(ctx context.Context, tenant string, body []byte, model Model, observer Observer) ([]byte, error) {
 	if tenant == "" {
 		return nil, errors.New("tenant is required")
 	}
@@ -127,9 +145,6 @@ func (e *Engine) Run(ctx context.Context, tenant string, body []byte, model Mode
 	c.tools = req["tools"]
 	c.model = req["model"]
 	c.toolChoice, c.choicePresent = req["tool_choice"]
-	if len(c.pending) > 0 {
-		return e.pause(c, previous)
-	}
 	choice := parseToolChoice(req["tool_choice"])
 	searchEnabled, err := rewriteTools(req)
 	if err != nil {
@@ -139,6 +154,45 @@ func (e *Engine) Run(ctx context.Context, tenant string, body []byte, model Mode
 	if searchEnabled && e.searcher == nil {
 		return nil, errors.New("searcher is required for web_search")
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	id, err := responseID()
+	if err != nil {
+		return nil, err
+	}
+	reserved := reservedResponse{id: id}
+	if observer != nil {
+		reserved.createdAt = time.Now().Unix()
+		start := map[string]json.RawMessage{
+			"id":                 json.RawMessage(strconv.Quote(id)),
+			"object":             json.RawMessage(`"response"`),
+			"status":             json.RawMessage(`"in_progress"`),
+			"output":             json.RawMessage(`[]`),
+			"created_at":         json.RawMessage(strconv.FormatInt(reserved.createdAt, 10)),
+			"background":         json.RawMessage(`false`),
+			"error":              json.RawMessage(`null`),
+			"incomplete_details": json.RawMessage(`null`),
+			"usage":              json.RawMessage(`null`),
+		}
+		publicFields(c, previous, start)
+		startBody, err := json.Marshal(start)
+		if err != nil {
+			return nil, fmt.Errorf("encode response start: %w", err)
+		}
+		if err := observer.Start(startBody); err != nil {
+			return nil, fmt.Errorf("observe response start: %w", err)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	if len(c.pending) > 0 {
+		return e.pause(c, previous, reserved)
+	}
+	// Stage private records until the request succeeds, so cancellation and
+	// observer failures never publish continuation state for partial requests.
+	var webRecords []savedWebRecord
 	delete(req, "previous_response_id")
 	req["stream"] = json.RawMessage("false")
 	var publicOutput []json.RawMessage
@@ -159,6 +213,9 @@ func (e *Engine) Run(ctx context.Context, tenant string, body []byte, model Mode
 		upstream, errModel := model(ctx, payload)
 		if errModel != nil {
 			return nil, fmt.Errorf("model request: %w", errModel)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
 		if len(upstream) > e.opts.MaxHistoryBytes {
 			return nil, errors.New("model response limit exceeded")
@@ -238,10 +295,14 @@ func (e *Engine) Run(ctx context.Context, tenant string, body []byte, model Mode
 		}
 		for i, item := range privateCalls {
 			callCount++
-			hiddenCall, result, webItem, errCall := e.execute(ctx, tenant, roundID, roundItems, item)
+			hiddenCall, result, webItem, errCall := e.execute(ctx, item, privatePositions[i], observer)
 			if errCall != nil {
 				return nil, errCall
 			}
+			webObj, _ := object(webItem)
+			webRecords = append(webRecords, savedWebRecord{id: stringValue(webObj["id"]), record: webRecord{
+				tenant: tenant, round: roundID, items: roundItems, call: hiddenCall, result: result,
+			}})
 			c.history[historyOutputStart+privateHistoryPositions[i]] = hiddenCall
 			c.history = append(c.history, result)
 			publicOutput[privatePositions[i]] = webItem
@@ -251,7 +312,17 @@ func (e *Engine) Run(ctx context.Context, tenant string, body []byte, model Mode
 		}
 		if len(privateCalls) == 0 || len(c.pending) > 0 {
 			applyUsage(response, usageTotals)
-			return e.finish(c, previous, response, publicOutput)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			result, err := e.finish(c, previous, response, publicOutput, reserved)
+			if err != nil {
+				return nil, err
+			}
+			for _, saved := range webRecords {
+				e.states.putWeb(saved.id, saved.record)
+			}
+			return result, nil
 		}
 		// A forced tool choice applies to this public request, not every internal
 		// continuation after its tool has been executed.
@@ -348,7 +419,7 @@ func (e *Engine) Compact(ctx context.Context, tenant string, body []byte, model 
 	if !e.historyWithinLimit(c.history) {
 		return nil, errors.New("conversation history limit exceeded")
 	}
-	return e.finish(c, previous, response, output)
+	return e.finish(c, previous, response, output, reservedResponse{})
 }
 
 type toolChoice struct {
@@ -648,10 +719,7 @@ func (e *Engine) historyWithinLimit(history []json.RawMessage) bool {
 	return true
 }
 
-func (e *Engine) finish(c conversation, previous string, response map[string]json.RawMessage, output []json.RawMessage) ([]byte, error) {
-	if output == nil {
-		output = make([]json.RawMessage, 0)
-	}
+func publicFields(c conversation, previous string, response map[string]json.RawMessage) {
 	if len(c.tools) > 0 {
 		response["tools"] = c.tools
 	}
@@ -663,13 +731,35 @@ func (e *Engine) finish(c conversation, previous string, response map[string]jso
 	if len(c.model) > 0 {
 		response["model"] = c.model
 	}
-	id, err := responseID()
-	if err != nil {
-		return nil, err
-	}
-	response["id"], _ = json.Marshal(id)
 	if previous != "" {
 		response["previous_response_id"], _ = json.Marshal(previous)
+	}
+}
+
+// reservedResponse belongs to one public request, including a pending-tool pause.
+// A zero createdAt preserves upstream metadata for unobserved and compact calls.
+type reservedResponse struct {
+	id        string
+	createdAt int64
+}
+
+func (e *Engine) finish(c conversation, previous string, response map[string]json.RawMessage, output []json.RawMessage, reserved reservedResponse) ([]byte, error) {
+	if output == nil {
+		output = make([]json.RawMessage, 0)
+	}
+	publicFields(c, previous, response)
+	var err error
+	id := reserved.id
+	if id == "" {
+		id, err = responseID()
+		if err != nil {
+			return nil, err
+		}
+	}
+	response["id"], _ = json.Marshal(id)
+	if reserved.createdAt != 0 {
+		response["created_at"], _ = json.Marshal(reserved.createdAt)
+		response["object"] = json.RawMessage(`"response"`)
 	}
 	response["output"], err = json.Marshal(output)
 	if err != nil {
@@ -684,7 +774,7 @@ func (e *Engine) finish(c conversation, previous string, response map[string]jso
 	return result, nil
 }
 
-func (e *Engine) pause(c conversation, previous string) ([]byte, error) {
+func (e *Engine) pause(c conversation, previous string, reserved reservedResponse) ([]byte, error) {
 	response, err := object(c.response)
 	if err != nil {
 		return nil, fmt.Errorf("decode paused response: %w", err)
@@ -699,7 +789,7 @@ func (e *Engine) pause(c conversation, previous string) ([]byte, error) {
 			output = append(output, item)
 		}
 	}
-	return e.finish(c, previous, response, output)
+	return e.finish(c, previous, response, output, reserved)
 }
 
 func rewriteTools(req map[string]json.RawMessage) (bool, error) {
@@ -752,7 +842,24 @@ func rewriteTools(req map[string]json.RawMessage) (bool, error) {
 
 const searchToolDefinition = `{"type":"function","name":"__deepseek_web_search","description":"Search the web, open a result page, or find text in a page. Use action search with query or queries, open_page with url, or find_in_page with url and pattern.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["search","open_page","find_in_page"]},"query":{"type":"string"},"queries":{"type":"array","items":{"type":"string"},"maxItems":4},"url":{"type":"string"},"pattern":{"type":"string"}},"required":["action"]}}`
 
-func (e *Engine) execute(ctx context.Context, tenant, roundID string, roundItems map[string]bool, call json.RawMessage) (json.RawMessage, json.RawMessage, json.RawMessage, error) {
+type savedWebRecord struct {
+	id     string
+	record webRecord
+}
+
+func observeSearch(ctx context.Context, observer Observer, index int, item json.RawMessage) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if observer != nil {
+		if err := observer.Search(index, item); err != nil {
+			return fmt.Errorf("observe search: %w", err)
+		}
+	}
+	return ctx.Err()
+}
+
+func (e *Engine) execute(ctx context.Context, call json.RawMessage, index int, observer Observer) (json.RawMessage, json.RawMessage, json.RawMessage, error) {
 	obj, _ := object(call)
 	var argText string
 	var args map[string]json.RawMessage
@@ -766,12 +873,8 @@ func (e *Engine) execute(ctx context.Context, tenant, roundID string, roundItems
 	if action == "" {
 		action = "search"
 	}
-	var data json.RawMessage
 	var queries []string
-	switch {
-	case searchErr != nil:
-		// Return the parsing error to the model as a tool result.
-	case action == "search":
+	if searchErr == nil && action == "search" {
 		query := strings.TrimSpace(stringValue(args["query"]))
 		if query != "" {
 			queries = []string{query}
@@ -789,9 +892,35 @@ func (e *Engine) execute(ctx context.Context, tenant, roundID string, roundItems
 				searchErr = errors.New("search queries cannot be empty")
 			}
 		}
-		if searchErr == nil {
-			data, searchErr = e.searchQueries(ctx, queries)
+	}
+	publicAction := map[string]any{"type": action}
+	for _, key := range []string{"query", "url", "pattern"} {
+		if value := stringValue(args[key]); value != "" {
+			publicAction[key] = value
 		}
+	}
+	if action == "search" {
+		publicAction["queries"] = queries
+	}
+	randomID, err := responseID()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	publicID := "ws_" + strings.TrimPrefix(randomID, "resp_")
+	publicItem := map[string]any{"id": publicID, "type": "web_search_call", "status": "in_progress", "action": publicAction}
+	public, err := json.Marshal(publicItem)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if err := observeSearch(ctx, observer, index, public); err != nil {
+		return nil, nil, nil, err
+	}
+	var data json.RawMessage
+	switch {
+	case searchErr != nil:
+		// Return argument validation errors to the model as failed tool results.
+	case action == "search":
+		data, searchErr = e.searchQueries(ctx, queries)
 	case action == "open_page" || action == "find_in_page":
 		url := strings.TrimSpace(stringValue(args["url"]))
 		if url == "" {
@@ -807,6 +936,12 @@ func (e *Engine) execute(ctx context.Context, tenant, roundID string, roundItems
 	default:
 		searchErr = fmt.Errorf("unsupported web_search action %q", action)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, nil, err
+	}
+	if errors.Is(searchErr, context.Canceled) || errors.Is(searchErr, context.DeadlineExceeded) {
+		return nil, nil, nil, searchErr
+	}
 	status := "completed"
 	if searchErr == nil && len(data) > e.opts.MaxHistoryBytes/2 {
 		searchErr = errors.New("search result limit exceeded")
@@ -819,23 +954,11 @@ func (e *Engine) execute(ctx context.Context, tenant, roundID string, roundItems
 		}
 		data, _ = json.Marshal(map[string]any{"error": map[string]string{"type": "search_error", "message": message}})
 	}
-	publicAction := map[string]any{"type": action}
-	for _, key := range []string{"query", "url", "pattern"} {
-		if value := stringValue(args[key]); value != "" {
-			publicAction[key] = value
-		}
-	}
 	if action == "search" {
-		publicAction["queries"] = queries
 		if sources := sourcesFromResult(data); len(sources) > 0 {
 			publicAction["sources"] = sources
 		}
 	}
-	randomID, err := responseID()
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	publicID := "ws_" + strings.TrimPrefix(randomID, "resp_")
 	hiddenCall, err := replaceCallID(call, publicID)
 	if err != nil {
 		return nil, nil, nil, err
@@ -844,11 +967,14 @@ func (e *Engine) execute(ctx context.Context, tenant, roundID string, roundItems
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	public, err := json.Marshal(map[string]any{"id": publicID, "type": "web_search_call", "status": status, "action": publicAction})
+	publicItem["status"] = status
+	public, err = json.Marshal(publicItem)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	e.states.putWeb(publicID, webRecord{tenant: tenant, round: roundID, items: roundItems, call: hiddenCall, result: toolOutput})
+	if err := observeSearch(ctx, observer, index, public); err != nil {
+		return nil, nil, nil, err
+	}
 	return hiddenCall, toolOutput, public, nil
 }
 
@@ -863,6 +989,9 @@ func (e *Engine) searchQueries(ctx context.Context, queries []string) (json.RawM
 	searches := make([]searchResult, 0, len(queries))
 	combined := make([]json.RawMessage, 0)
 	for _, query := range queries {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		result, err := e.searcher.Search(ctx, query)
 		if err != nil {
 			return nil, err

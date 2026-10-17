@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 )
 
@@ -79,6 +80,13 @@ type hostModelStreamReadResponse struct {
 }
 
 func executeHostModel(ctx context.Context, exec executorRequest, model modelConfig, body []byte) ([]byte, error) {
+	return executeHostModelEvents(ctx, exec, model, body, nil)
+}
+
+func executeHostModelEvents(ctx context.Context, exec executorRequest, model modelConfig, body []byte, onEvent func(json.RawMessage) error) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var request map[string]json.RawMessage
 	if err := json.Unmarshal(body, &request); err != nil {
 		return nil, fmt.Errorf("decode model request: %w", err)
@@ -124,6 +132,7 @@ func executeHostModel(ctx context.Context, exec executorRequest, model modelConf
 		}
 	}()
 	collector := newResponsesCollector()
+	collector.onEvent = onEvent
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -142,18 +151,17 @@ func executeHostModel(ctx context.Context, exec executorRequest, model modelConf
 		if err := collector.feed(chunk.Payload); err != nil {
 			return nil, err
 		}
-		if chunk.Done {
+		if len(collector.completed) > 0 || chunk.Done {
 			return collector.result()
 		}
 	}
 }
 
 type responsesCollector struct {
+	onEvent    func(json.RawMessage) error
 	pending    []byte
 	totalBytes int
 	completed  json.RawMessage
-	items      []json.RawMessage
-	created    json.RawMessage
 	failed     bool
 }
 
@@ -168,8 +176,8 @@ func (c *responsesCollector) feed(chunk []byte) error {
 	for {
 		index := bytes.Index(c.pending, []byte("\n\n"))
 		separator := 2
-		if index < 0 {
-			index = bytes.Index(c.pending, []byte("\r\n\r\n"))
+		if crlf := bytes.Index(c.pending, []byte("\r\n\r\n")); crlf >= 0 && (index < 0 || crlf < index) {
+			index = crlf
 			separator = 4
 		}
 		if index < 0 {
@@ -205,23 +213,22 @@ func (c *responsesCollector) frame(frame []byte) error {
 	if err := json.Unmarshal(data, &event); err != nil {
 		return fmt.Errorf("decode host Responses event: %w", err)
 	}
-	switch event.Type {
-	case "response.created":
-		c.created = append(c.created[:0], event.Response...)
-	case "response.output_item.done":
-		if len(event.Item) > 0 {
-			c.items = append(c.items, append(json.RawMessage(nil), event.Item...))
+	if c.onEvent != nil {
+		if err := c.onEvent(json.RawMessage(data)); err != nil {
+			return err
 		}
+	}
+	switch event.Type {
 	case "response.completed":
 		c.completed = append(c.completed[:0], event.Response...)
-	case "response.failed", "response.incomplete":
+	case "response.failed", "response.incomplete", "error":
 		c.failed = true
 	}
 	return nil
 }
 
 func (c *responsesCollector) result() ([]byte, error) {
-	if len(bytes.TrimSpace(c.pending)) > 0 {
+	if len(c.completed) == 0 && len(bytes.TrimSpace(c.pending)) > 0 {
 		if err := c.frame(c.pending); err != nil {
 			return nil, err
 		}
@@ -275,7 +282,22 @@ func executeStream(raw []byte) ([]byte, error) {
 		}()
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
+		var emitMu sync.Mutex
+		emit := func(payload []byte) error {
+			emitMu.Lock()
+			defer emitMu.Unlock()
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			_, err := hostCall("host.stream.emit", streamEmitRequest{StreamID: req.StreamID, Payload: payload})
+			if err != nil {
+				cancel()
+			}
+			return err
+		}
+		live := newLiveResponse(emit)
 		heartbeatDone := make(chan struct{})
+		stopHeartbeat := make(chan struct{})
 		go func() {
 			defer close(heartbeatDone)
 			ticker := time.NewTicker(time.Second)
@@ -284,29 +306,28 @@ func executeStream(raw []byte) ([]byte, error) {
 				select {
 				case <-ctx.Done():
 					return
+				case <-stopHeartbeat:
+					return
 				case <-ticker.C:
-					if _, err := hostCall("host.stream.emit", streamEmitRequest{StreamID: req.StreamID, Payload: []byte(": keep-alive\n\n")}); err != nil {
-						cancel()
+					if err := emit([]byte(": keep-alive\n\n")); err != nil {
 						return
 					}
 				}
 			}
 		}()
-		response, err := runEngine(ctx, cfg, req)
-		cancel()
-		<-heartbeatDone
+		var stopOnce sync.Once
+		stop := func() { stopOnce.Do(func() { close(stopHeartbeat); <-heartbeatDone }) }
+		defer stop()
+		response, err := runEngineLive(ctx, cfg, req, live)
+		stop()
 		if err != nil {
 			closeError = err.Error()
+			_ = live.Fail(err)
 			return
 		}
-		payload, err := responseSSE(response)
-		if err != nil {
+		if err := live.Complete(response); err != nil {
 			closeError = err.Error()
-			return
-		}
-		_, err = hostCall("host.stream.emit", streamEmitRequest{StreamID: req.StreamID, Payload: payload})
-		if err != nil {
-			closeError = err.Error()
+			_ = live.Fail(err)
 		}
 	}()
 	return okEnvelope(map[string]any{"headers": http.Header{"Content-Type": {"text/event-stream"}}})

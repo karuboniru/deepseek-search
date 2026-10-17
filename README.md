@@ -101,13 +101,12 @@ execution is currently unsupported; the extension does not advertise it there.
 - Original request fields and raw reasoning/output items are retained. Each
   nested model request goes through host translation, auth scheduling and final
   payload configuration; the plugin does not modify the resulting wire payload.
-- SSE output is synthesized after internal rounds finish. It is a single
-  Responses lifecycle with stable output indexes and accumulated token usage,
-  rather than concatenated upstream streams. Keep-alive comments are sent while
-  waiting. This initial release buffers text instead of forwarding token deltas
-  immediately. Reasoning summaries and reasoning text include their delta/done
-  events so event-driven clients can display them; encrypted reasoning remains
-  opaque. Early upstream EOF is an error, not a fabricated completion.
+- Streaming requests forward public text, reasoning, and client-tool argument
+  deltas as upstream events arrive. Multiple model rounds share one public
+  Responses lifecycle with stable item IDs, global output indexes, monotonically
+  increasing sequence numbers, and accumulated token usage. Private search
+  function names and argument fragments stay inside the plugin. Keep-alive
+  comments continue during otherwise idle periods.
 - Search errors become tool results that the model can handle. Limits and
   missing context fail explicitly. There are no post-connect network deadlines;
   cancellation closes nested streams and cancels search requests. Nonstreaming
@@ -119,34 +118,35 @@ proxy. Search and Fetch are independently rate-limited per plugin client.
 Multiple processes or clients sharing a DeepSeek account must coordinate its
 account-wide limit externally. Retries are bounded for HTTP 408, 429 and 5xx.
 
-### Streaming limitation
+### Streaming behavior and remaining limits
 
-For a client request with `stream: true`, every internal model round uses the
-host's streaming API, including rounds after a search. However, the plugin
-collects each upstream stream into a completed Responses object and waits until
-the search loop finishes (or pauses for a client-managed tool). It then emits
-one synthesized SSE response to the client. Text and reasoning delta events
-contain buffered content; they do not arrive as the model generates tokens.
-While waiting, the client receives only keep-alive comments. Public search-call
-items are also delayed. This applies to every request routed through the
-plugin, even when the model ultimately makes no search call. A client request
-with `stream: false` uses non-streaming upstream calls throughout.
+For `stream: true`, every internal model round uses the host's streaming API,
+including rounds after searches. Public text and reasoning deltas are delivered
+immediately, without waiting for that round or the whole search loop to finish.
+Client-tool arguments are also streamed once the tool is identified as public.
+Only one `response.created` / `response.in_progress` lifecycle is exposed, and
+only the final response emits `response.completed` and `[DONE]`.
 
-This is a limitation of the current adapter design, not a DeepSeek Search API
-or Responses protocol requirement. The orchestration engine consumes complete
-response objects: it extracts private search function calls, executes them,
-injects results into history, and combines multiple upstream responses into one
-public response. The current SSE serializer runs only after that work returns.
-It therefore cannot forward live deltas, and a later upstream failure prevents
-earlier buffered content from being delivered as a successful response.
+Once a model round supplies complete search calls, the plugin emits public
+`web_search_call` items and `response.web_search_call.in_progress` / `searching`
+events before executing each search, followed by completion and item-done
+notifications. Multiple searches still execute sequentially. Search execution
+waits for the model round's completed response so its calls, reasoning, and
+history can be validated together. A function whose name is not yet available
+is temporarily buffered to avoid leaking private search arguments.
 
-True incremental output is possible but requires an event-aware orchestration
-path: map item IDs and output indexes across rounds, keep a single public
-response lifecycle, hide private search arguments, emit public search events,
-and handle cancellation or errors after partial output has already been sent.
-Simply forwarding upstream SSE would expose internal calls and multiple
-response completion events. The reasoning-event fix restores client rendering
-but does not remove this buffering limitation.
+The plugin still retains completed items for context replay and final response
+assembly; retaining history does not delay live delivery. If an upstream only
+provides completed snapshots, the plugin synthesizes missing events when those
+snapshots arrive. It cannot create token-level latency that the upstream does
+not provide. Reconciliation avoids duplicate text and rejects contradictions
+between already emitted content and final snapshots.
+
+If a later upstream round fails after partial output, the public response emits
+`response.failed` rather than a successful completion. Already delivered content
+cannot be retracted. A disconnected client cancels active model/search requests;
+no additional error event can be guaranteed once the transport is disconnected.
+Non-streaming requests continue to use non-streaming upstream calls.
 
 ## Search scope
 
@@ -180,7 +180,8 @@ DEEPSEEK_PLUGIN_TEST_LIBRARY="$PWD/standalone/deepseek-search/build/deepseek-sea
 
 That test loads the actual shared library, crosses the host callback ABI,
 executes local fake search requests, and verifies mixed tools, continuation,
-and the synthesized Responses stream. It does not require a DeepSeek key.
+and the Responses stream. `TestDeepSeekSharedLibraryLiveStream` gates upstream
+completion until reasoning and text deltas cross the actual C ABI. It does not require a DeepSeek key.
 
 `TestDeepSeekSharedLibraryPayloadRulesEverySearchRound` additionally sends each
 model round through the real OpenAI-compatible executor and checks final payload
@@ -192,3 +193,10 @@ Live checks used `deepseek-flash` through a temporary proxy and covered search
 with `external_web_access: false`, previous-response continuation, and streaming
 full-history replay with two search queries. Other upstream model families have
 not been live-tested.
+
+Live-stream regression tests use explicit synchronization barriers rather than
+sleep-based timing: upstream completion and search responses remain blocked
+until the client has received the expected early events. Coverage includes
+multiple searches/rounds, partial client-tool results, previous-response and
+full-history replay, final output/event consistency, fragmented SSE, duplicate
+IDs, malformed/contradictory events, upstream failure, and client disconnects.

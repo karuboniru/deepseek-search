@@ -385,6 +385,10 @@ func callHost(method string, request any) (json.RawMessage, error) {
 }
 
 func runEngine(ctx context.Context, cfg *runtimeConfig, req executorRequest) ([]byte, error) {
+	return runEngineLive(ctx, cfg, req, nil)
+}
+
+func runEngineLive(ctx context.Context, cfg *runtimeConfig, req executorRequest, live *liveResponse) ([]byte, error) {
 	model, ok := cfg.models[req.Model]
 	if !cfg.Enabled || !ok || !isResponsesFormat(req.Format) {
 		return nil, errors.New("model is not enabled for DeepSeek search")
@@ -402,12 +406,26 @@ func runEngine(ctx context.Context, cfg *runtimeConfig, req executorRequest) ([]
 			return executeHostModelNonstream(ctx, req, model, body)
 		})
 	}
-	return cfg.engine.Run(ctx, tenantIdentity(req), body, func(ctx context.Context, body []byte) ([]byte, error) {
+	modelCall := func(ctx context.Context, body []byte) ([]byte, error) {
 		if !req.Stream {
 			return executeHostModelNonstream(ctx, req, model, body)
 		}
-		return executeHostModel(ctx, req, model, body)
-	})
+		if live == nil {
+			return executeHostModel(ctx, req, model, body)
+		}
+		if err := live.BeginRound(); err != nil {
+			return nil, err
+		}
+		response, err := executeHostModelEvents(ctx, req, model, body, live.Event)
+		if err != nil {
+			return nil, err
+		}
+		return live.EndRound(response)
+	}
+	if live != nil {
+		return cfg.engine.RunObserved(ctx, tenantIdentity(req), body, modelCall, live)
+	}
+	return cfg.engine.Run(ctx, tenantIdentity(req), body, modelCall)
 }
 
 func execute(raw []byte) ([]byte, error) {

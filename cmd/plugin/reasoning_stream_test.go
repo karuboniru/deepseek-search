@@ -235,7 +235,8 @@ func assertReasoningOutputPreserved(t *testing.T, response []byte, events []reas
 	if err := json.Unmarshal(response, &original); err != nil {
 		t.Fatal(err)
 	}
-	var doneItems []any
+	doneItems := make([]any, len(original.Output))
+	seenIndexes := make(map[int]bool)
 	var completedOutput []any
 	for _, event := range events {
 		if event.Type == "response.output_item.done" {
@@ -243,7 +244,11 @@ func assertReasoningOutputPreserved(t *testing.T, response []byte, events []reas
 			if err := json.Unmarshal(event.Item, &item); err != nil {
 				t.Fatal(err)
 			}
-			doneItems = append(doneItems, item)
+			if event.OutputIndex < 0 || event.OutputIndex >= len(doneItems) || seenIndexes[event.OutputIndex] {
+				t.Fatalf("invalid or repeated output index %d", event.OutputIndex)
+			}
+			seenIndexes[event.OutputIndex] = true
+			doneItems[event.OutputIndex] = item
 		}
 		if event.Type == "response.completed" {
 			var completed struct {
