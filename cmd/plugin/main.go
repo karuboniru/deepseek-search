@@ -273,11 +273,24 @@ func configure(raw []byte) error {
 		runtime.engine = adapter.NewEngine(client, adapter.Options{
 			MaxRounds: cfg.MaxRounds, MaxCalls: cfg.MaxCalls,
 			MaxStates: cfg.MaxStates, MaxHistoryItems: cfg.MaxHistoryItems,
-			MaxHistoryBytes: cfg.MaxHistoryBytes,
+			MaxHistoryBytes:      cfg.MaxHistoryBytes,
+			OnSearchCacheRestore: logSearchCacheRestore,
 		})
 	}
 	activeConfig.Store(runtime)
 	return nil
+}
+
+// logSearchCacheRestore emits one diagnostic per request that used cached search
+// history. Logging is best effort and never includes the search payload.
+func logSearchCacheRestore(ctx context.Context) {
+	callbackID, _ := ctx.Value(callbackIDContextKey{}).(string)
+	_, _ = hostCall("host.log", map[string]any{
+		"host_callback_id": callbackID,
+		"level":            "info",
+		"message":          "DeepSeek search restored historical search context from server cache",
+		"fields":           map[string]any{"plugin": "deepseek-search", "event": "search_context_cache_fallback"},
+	})
 }
 
 func currentConfig() *runtimeConfig {

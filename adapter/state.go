@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +16,9 @@ type Options struct {
 	MaxStates       int
 	MaxHistoryItems int
 	MaxHistoryBytes int
+	// OnSearchCacheRestore reports at most one cache fallback per request.
+	// It may be called concurrently by requests and receives no private data.
+	OnSearchCacheRestore func(context.Context)
 }
 
 func (o Options) defaults() Options {
@@ -72,6 +76,7 @@ type webRecord struct {
 	tenant string
 	round  string
 	items  map[string]bool
+	tail   []string
 	call   json.RawMessage
 	result json.RawMessage
 }
@@ -99,6 +104,24 @@ func (s *stateStore) putWeb(id string, item webRecord) {
 		delete(s.webItems, s.webOrder[0])
 		s.webOrder = s.webOrder[1:]
 	}
+}
+
+func (s *stateStore) deleteWeb(tenant, id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item, ok := s.webItems[id]
+	if !ok || item.tenant != tenant {
+		return
+	}
+	delete(s.webItems, id)
+	order := s.webOrder[:0]
+	for _, savedID := range s.webOrder {
+		if savedID != id {
+			order = append(order, savedID)
+		}
+	}
+	clear(s.webOrder[len(order):])
+	s.webOrder = order
 }
 
 func (s *stateStore) get(tenant, id string) (conversation, bool) {

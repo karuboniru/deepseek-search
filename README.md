@@ -109,7 +109,8 @@ Existing response and history size limits still apply.
 - Mixed client tools pause model continuation until their results arrive;
   function and custom tool call IDs are validated before replay.
 - Both `previous_response_id` and full-history replay are supported. Public
-  search items have random IDs and map to the hidden call/result history.
+  search items have random IDs and carry their call/result history in
+  `web_search_call.encrypted_content`, with server memory as a fallback.
   Replaying an item does not repeat its search. Full transcripts replace prior
   history instead of appending stale state.
 - `/responses/compact` hydrates hidden search history before delegating to the
@@ -117,11 +118,13 @@ Existing response and history size limits still apply.
   continuation. This requires an upstream that supports host compaction.
 - State is isolated by the host-authenticated `caller_scope`. Hosts without
   frontend authentication share an anonymous scope.
-- State is bounded and in memory. Restarting, reconfiguring, or evicting state
-  makes dependent response/search IDs unavailable; requests fail explicitly.
-  Do not route a conversation across independent plugin processes without
-  affinity. A compacted transcript that no longer references old search IDs
-  can start fresh.
+- State is bounded and in memory. Full-history replay first uses client-returned
+  search context, then cached search records. When both are missing, a placeholder
+  tells the model the historical search result is unavailable; replay does not
+  repeat the search or fail just because that search record was evicted.
+  Requests containing only `previous_response_id` still need the saved
+  conversation and process affinity; a missing response ID cannot reconstruct
+  an entire conversation. Full-history replay can recover independently of it.
 - Original request fields and raw reasoning/output items are retained. Each
   nested model request goes through host translation, auth scheduling and final
   payload configuration; the plugin does not modify the resulting wire payload.
@@ -129,10 +132,11 @@ Existing response and history size limits still apply.
   deltas as upstream events arrive. Multiple model rounds share one public
   Responses lifecycle with stable item IDs, global output indexes, monotonically
   increasing sequence numbers, and accumulated token usage. Private search
-  function names and argument fragments stay inside the plugin. Keep-alive
+  calls are not exposed as executable client tools. Their complete replay data
+  is carried in the final search item as described below. Keep-alive
   comments continue during otherwise idle periods.
-- Search errors become tool results that the model can handle. Limits and
-  missing context fail explicitly. There are no post-connect network deadlines;
+- Search errors become tool results that the model can handle. Invalid payloads
+  and exceeded limits fail explicitly. There are no post-connect network deadlines;
   cancellation closes nested streams and cancels search requests. Nonstreaming
   calls retain the host callback's request cancellation context.
 
@@ -171,6 +175,40 @@ If a later upstream round fails after partial output, the public response emits
 cannot be retracted. A disconnected client cancels active model/search requests;
 no additional error event can be guaranteed once the transport is disconnected.
 Non-streaming requests continue to use non-streaming upstream calls.
+
+### Client-carried search context
+
+The `encrypted_content` field contains **plaintext, versioned JSON**, not
+ciphertext. The field name is used for client compatibility. It includes the
+original search call, result, and ordering metadata needed to rebuild upstream
+history. Clients and anyone with access to their saved transcripts can read it;
+it is not a signature or proof of authenticity.
+
+A valid returned payload takes precedence over server memory and is decoded
+without replacing its search results with cached data. Missing, null, or empty
+payloads fall back to the tenant-scoped cache, then to an explicit unavailable
+result placeholder. Malformed nonempty payloads are rejected rather than silently
+substituted. After a valid client payload is decoded, the corresponding search
+cache entry is evicted immediately to reserve capacity for clients that cannot
+replay it. Saved response snapshots remain available for `previous_response_id`.
+A request that restores one or more search entries from cache emits one info log
+with event `search_context_cache_fallback`; it never logs per restored item or
+includes search queries, results, or credentials. No recovery path automatically
+repeats an old search. Decoded history and ordinary request fields retain their configured byte limits.
+The wire request allows up to four times the history byte limit to accommodate
+JSON escaping in replay payloads; this does not enlarge the model context budget.
+
+Streaming includes the complete payload in `response.output_item.done` as well
+as the final response. RikkaHub's Responses implementation preserves the raw
+search item. The inspected Codex version clears this field for providers whose
+`name` is not exactly `"OpenAI"`; set that display name on your custom provider
+if you want client-carried replay. This is a version-dependent compatibility
+workaround and also affects other OpenAI-specific client behavior. Clients that
+strip the field continue to use the cache/placeholder fallback.
+
+Compaction restores available search results before invoking upstream compaction.
+Once the client replaces old history with a summary, subsequent requests depend
+on that summary, not on indefinite retention of old search results.
 
 ## Search scope
 

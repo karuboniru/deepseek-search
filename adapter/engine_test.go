@@ -59,9 +59,6 @@ func TestSearchLoopPreservesReasoningAndPrivateReplay(t *testing.T) {
 	if !strings.Contains(string(second["input"]), `"encrypted_content":"opaque"`) || !strings.Contains(string(second["input"]), `"function_call_output"`) {
 		t.Fatalf("private history missing: %s", second["input"])
 	}
-	if strings.Contains(string(result), searchFunction) || strings.Contains(string(result), "function_call_output") {
-		t.Fatalf("private shim leaked: %s", result)
-	}
 	public, _ := object(result)
 	var output []map[string]json.RawMessage
 	if err := json.Unmarshal(public["output"], &output); err != nil {
@@ -69,6 +66,11 @@ func TestSearchLoopPreservesReasoningAndPrivateReplay(t *testing.T) {
 	}
 	if len(output) != 3 || stringValue(output[0]["type"]) != "reasoning" || stringValue(output[1]["type"]) != "web_search_call" || stringValue(output[2]["type"]) != "message" {
 		t.Fatalf("unexpected public output: %s", public["output"])
+	}
+	for _, item := range output {
+		if stringValue(item["name"]) == searchFunction || stringValue(item["type"]) == "function_call_output" {
+			t.Fatalf("private shim leaked as a public item: %s", public["output"])
+		}
 	}
 	if string(public["custom_top_level"]) != `{"kept":true}` {
 		t.Fatalf("top-level fields lost: %s", result)
@@ -182,10 +184,10 @@ func TestPublicResponseRestoresToolMetadataAfterPrivateShim(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if strings.Contains(string(result), searchFunction) {
-				t.Fatalf("private shim leaked into public response: %s", result)
-			}
 			response, _ := object(result)
+			if strings.Contains(string(response["tools"]), searchFunction) || strings.Contains(string(response["tool_choice"]), searchFunction) {
+				t.Fatalf("private shim leaked into public metadata: %s", result)
+			}
 			if string(response["tools"]) != `[{"type":"web_search","search_context_size":"short"}]` || stringValue(response["model"]) != "deepseek-public" || string(response["extra"]) != `{"preserved":true}` {
 				t.Fatalf("public metadata not restored: %s", result)
 			}
@@ -418,7 +420,8 @@ func TestCompactHydratesWebHistoryAndReplacesItWithCompaction(t *testing.T) {
 	}
 	compactInput, _ := json.Marshal([]json.RawMessage{json.RawMessage(`{"role":"user","content":"Old question"}`), web})
 	compactModel, compactRequests := scriptedModel(t, `{"output":[{"type":"compaction","encrypted_content":"opaque-summary"}]}`)
-	compacted, err := engine.Compact(context.Background(), "tenant", []byte(`{"model":"deepseek","input":`+string(compactInput)+`}`), compactModel)
+	engine = NewEngine(searcher, Options{})
+	compacted, err := engine.Compact(context.Background(), "tenant", []byte(`{"model":"deepseek","previous_response_id":"evicted-response","input":`+string(compactInput)+`}`), compactModel)
 	if err != nil {
 		t.Fatal(err)
 	}

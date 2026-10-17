@@ -307,8 +307,9 @@ func TestExecuteStreamDeliversLiveAcrossSearchRoundsAndContinues(t *testing.T) {
 	if closeErr != "" {
 		t.Fatalf("stream error = %q, payload = %s", closeErr, payload)
 	}
+	publicFields := liveWithoutSearchCapsules(t, payload)
 	for _, secret := range []string{"__deepseek_web_search", "private_call_", "private-argument-never-public", "response.function_call_arguments"} {
-		if bytes.Contains(payload, []byte(secret)) {
+		if bytes.Contains(publicFields, []byte(secret)) {
 			t.Fatalf("private tool data %q leaked: %s", secret, payload)
 		}
 	}
@@ -462,8 +463,9 @@ func TestExecuteStreamMixedClientCallsPauseUntilAllResults(t *testing.T) {
 	if closeErr != "" {
 		t.Fatalf("mixed first stream failed: %q", closeErr)
 	}
+	publicFields := liveWithoutSearchCapsules(t, pausedPayload)
 	for _, secret := range []string{"__deepseek_web_search", "private_mixed", "private-argument-never-public"} {
-		if bytes.Contains(pausedPayload, []byte(secret)) {
+		if bytes.Contains(publicFields, []byte(secret)) {
 			t.Fatalf("mixed response leaked private tool data %q: %s", secret, pausedPayload)
 		}
 	}

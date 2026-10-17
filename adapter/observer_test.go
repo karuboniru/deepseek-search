@@ -140,6 +140,9 @@ func TestObserverPublicOrderAcrossRounds(t *testing.T) {
 		if !strings.Contains(string(after["action"]), "https://example.com") {
 			t.Fatal("completed search lacks sources")
 		}
+		if stringValue(after["encrypted_content"]) == "" || string(after["encrypted_content"]) != string(out["encrypted_content"]) {
+			t.Fatalf("completed search event lacks final replay capsule: event=%s output=%s", observed[i+1], output[indexes[i]])
+		}
 	}
 	// The ID supplied to Start is immediately usable for a later public turn.
 	follow, _ := json.Marshal(map[string]any{"previous_response_id": stringValue(start["id"]), "input": "follow up"})

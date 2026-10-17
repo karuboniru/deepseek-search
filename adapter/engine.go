@@ -63,7 +63,7 @@ func (e *Engine) RunObserved(ctx context.Context, tenant string, body []byte, mo
 	if err != nil {
 		return nil, fmt.Errorf("decode request: %w", err)
 	}
-	if len(body) > e.opts.MaxHistoryBytes {
+	if !e.requestWithinLimit(body) {
 		return nil, errors.New("request body limit exceeded")
 	}
 	var previous string
@@ -73,22 +73,32 @@ func (e *Engine) RunObserved(ctx context.Context, tenant string, body []byte, mo
 		}
 	}
 	c := conversation{tenant: tenant, pending: make(map[string]json.RawMessage)}
+	missingPrevious := false
 	if previous != "" {
 		var ok bool
-		c, ok = e.states.get(tenant, previous)
+		var saved conversation
+		saved, ok = e.states.get(tenant, previous)
 		if !ok {
-			return nil, errors.New("previous_response_id not found for tenant")
+			missingPrevious = true
+		} else {
+			c = saved
 		}
 	}
 	input, err := inputItems(req["input"])
 	if err != nil {
 		return nil, fmt.Errorf("decode input: %w", err)
 	}
-	input, restoredWeb, err := e.restorePublicWeb(tenant, input)
+	if !e.requestFieldsWithinLimit(body, input) {
+		return nil, errors.New("request body limit exceeded")
+	}
+	input, restoredWeb, err := e.restorePublicWeb(ctx, tenant, input)
 	if err != nil {
 		return nil, err
 	}
 	fullReplay := restoredWeb || hasCompactionMarker(input) || (previous == "" && hasClientCall(input))
+	if missingPrevious && !fullReplay {
+		return nil, errors.New("previous_response_id not found for tenant")
+	}
 	if fullReplay {
 		c.pending, err = replayPending(input)
 		if err != nil {
@@ -295,14 +305,14 @@ func (e *Engine) RunObserved(ctx context.Context, tenant string, body []byte, mo
 		}
 		for i, item := range privateCalls {
 			callCount++
-			hiddenCall, result, webItem, errCall := e.execute(ctx, item, privatePositions[i], observer)
+			record := webRecord{tenant: tenant, round: roundID, items: roundItems, tail: roundTail(output, privateHistoryPositions[i])}
+			hiddenCall, result, webItem, errCall := e.execute(ctx, item, privatePositions[i], observer, record)
 			if errCall != nil {
 				return nil, errCall
 			}
 			webObj, _ := object(webItem)
-			webRecords = append(webRecords, savedWebRecord{id: stringValue(webObj["id"]), record: webRecord{
-				tenant: tenant, round: roundID, items: roundItems, call: hiddenCall, result: result,
-			}})
+			record.call, record.result = hiddenCall, result
+			webRecords = append(webRecords, savedWebRecord{id: stringValue(webObj["id"]), record: record})
 			c.history[historyOutputStart+privateHistoryPositions[i]] = hiddenCall
 			c.history = append(c.history, result)
 			publicOutput[privatePositions[i]] = webItem
@@ -337,7 +347,7 @@ func (e *Engine) Compact(ctx context.Context, tenant string, body []byte, model 
 	if tenant == "" || model == nil {
 		return nil, errors.New("tenant and model are required")
 	}
-	if len(body) > e.opts.MaxHistoryBytes {
+	if !e.requestWithinLimit(body) {
 		return nil, errors.New("request body limit exceeded")
 	}
 	req, err := object(body)
@@ -346,25 +356,36 @@ func (e *Engine) Compact(ctx context.Context, tenant string, body []byte, model 
 	}
 	previous := stringValue(req["previous_response_id"])
 	c := conversation{tenant: tenant, pending: make(map[string]json.RawMessage)}
+	missingPrevious := false
 	if len(req["previous_response_id"]) > 0 && string(req["previous_response_id"]) != "null" && previous == "" {
 		return nil, errors.New("invalid previous_response_id")
 	}
 	if previous != "" {
 		var ok bool
-		c, ok = e.states.get(tenant, previous)
+		var saved conversation
+		saved, ok = e.states.get(tenant, previous)
 		if !ok {
-			return nil, errors.New("previous_response_id not found for tenant")
+			missingPrevious = true
+		} else {
+			c = saved
 		}
 	}
 	input, err := inputItems(req["input"])
 	if err != nil {
 		return nil, fmt.Errorf("decode compact input: %w", err)
 	}
-	input, restoredWeb, err := e.restorePublicWeb(tenant, input)
+	if !e.requestFieldsWithinLimit(body, input) {
+		return nil, errors.New("request body limit exceeded")
+	}
+	input, restoredWeb, err := e.restorePublicWeb(ctx, tenant, input)
 	if err != nil {
 		return nil, err
 	}
-	if restoredWeb || hasCompactionMarker(input) || (previous == "" && hasClientCall(input)) {
+	fullReplay := restoredWeb || hasCompactionMarker(input) || (previous == "" && hasClientCall(input))
+	if missingPrevious && !fullReplay {
+		return nil, errors.New("previous_response_id not found for tenant")
+	}
+	if fullReplay {
 		c.history = append([]json.RawMessage(nil), input...)
 	} else {
 		c.history = append(c.history, input...)
@@ -541,6 +562,22 @@ func roundMembership(output []json.RawMessage) map[string]bool {
 	return items
 }
 
+// roundTail preserves exact positions, including repeated ID-less items, after
+// this search in its original upstream output. Empty entries mark searches.
+func roundTail(output []json.RawMessage, position int) []string {
+	tail := make([]string, 0, len(output)-position-1)
+	for _, item := range output[position+1:] {
+		obj, _ := object(item)
+		if stringValue(obj["type"]) == "function_call" && stringValue(obj["name"]) == searchFunction {
+			tail = append(tail, "")
+			continue
+		}
+		keys := itemKeys(item)
+		tail = append(tail, keys[0])
+	}
+	return tail
+}
+
 func itemKeys(item json.RawMessage) []string {
 	var keys []string
 	obj, err := object(item)
@@ -571,12 +608,17 @@ func belongsToRound(record webRecord, item json.RawMessage) bool {
 	return false
 }
 
-func (e *Engine) restorePublicWeb(tenant string, input []json.RawMessage) ([]json.RawMessage, bool, error) {
+func (e *Engine) restorePublicWeb(ctx context.Context, tenant string, input []json.RawMessage) ([]json.RawMessage, bool, error) {
 	var restored []json.RawMessage
 	var hiddenResults []json.RawMessage
 	var current webRecord
 	seen := make(map[string]bool)
 	found := false
+	cacheRestored := false
+	flushResults := func() {
+		restored = append(restored, hiddenResults...)
+		hiddenResults = nil
+	}
 	for _, item := range input {
 		obj, _ := object(item)
 		typ := stringValue(obj["type"])
@@ -587,44 +629,50 @@ func (e *Engine) restorePublicWeb(tenant string, input []json.RawMessage) ([]jso
 				return nil, false, fmt.Errorf("duplicate web_search_call ID %q", id)
 			}
 			seen[id] = true
-			record, ok := e.states.getWeb(tenant, id)
-			if !ok {
-				return nil, false, fmt.Errorf("web_search_call ID %q not found for tenant", id)
-			}
-			if len(hiddenResults) > 0 && current.round != record.round {
-				restored = append(restored, hiddenResults...)
-				hiddenResults = nil
-			}
-			call, err := replaceCallID(record.call, id)
+			record, cached, err := e.publicWebRecord(tenant, id, obj)
 			if err != nil {
 				return nil, false, err
 			}
-			result, err := replaceCallID(record.result, id)
-			if err != nil {
-				return nil, false, err
+			cacheRestored = cacheRestored || cached
+			if len(hiddenResults) > 0 && (current.round != record.round ||
+				(current.tail != nil && (len(current.tail) == 0 || current.tail[0] != ""))) {
+				flushResults()
 			}
-			restored = append(restored, call)
-			hiddenResults = append(hiddenResults, result)
+			restored = append(restored, record.call)
+			hiddenResults = append(hiddenResults, record.result)
 			current = record
 			found = true
-		case "function_call":
-			if stringValue(obj["name"]) == searchFunction {
+		default:
+			if typ == "function_call" && stringValue(obj["name"]) == searchFunction {
 				return nil, false, errors.New("private web_search call cannot be supplied by client")
 			}
-			if len(hiddenResults) > 0 && !belongsToRound(current, item) {
-				restored = append(restored, hiddenResults...)
-				hiddenResults = nil
-			}
-			restored = append(restored, item)
-		default:
-			if len(hiddenResults) > 0 && !belongsToRound(current, item) {
-				restored = append(restored, hiddenResults...)
-				hiddenResults = nil
+			if len(hiddenResults) > 0 {
+				if current.tail != nil {
+					matches := false
+					if len(current.tail) > 0 && current.tail[0] != "" {
+						for _, key := range itemKeys(item) {
+							matches = matches || key == current.tail[0]
+						}
+					}
+					if matches {
+						current.tail = current.tail[1:]
+					} else {
+						flushResults()
+					}
+				} else if !belongsToRound(current, item) {
+					flushResults()
+				}
 			}
 			restored = append(restored, item)
 		}
+		if len(hiddenResults) > 0 && current.tail != nil && len(current.tail) == 0 {
+			flushResults()
+		}
 	}
-	restored = append(restored, hiddenResults...)
+	flushResults()
+	if cacheRestored && e.opts.OnSearchCacheRestore != nil {
+		e.opts.OnSearchCacheRestore(ctx)
+	}
 	return restored, found, nil
 }
 
@@ -703,6 +751,30 @@ func applyUsage(response map[string]json.RawMessage, totals map[string]int64) {
 		usage[key], _ = json.Marshal(count)
 	}
 	response["usage"], _ = json.Marshal(usage)
+}
+
+// Public replay capsules add JSON string escaping around the private history.
+// Keep that wire expansion bounded while retaining the decoded history limit.
+func (e *Engine) requestWithinLimit(body []byte) bool {
+	return len(body) <= e.opts.MaxHistoryBytes || (len(body)-1)/4 < e.opts.MaxHistoryBytes
+}
+
+// Discount only capsule string values from the ordinary request budget. Tools,
+// messages, and all other request fields retain their existing byte limit; the
+// recovered private history is bounded separately after capsule restoration.
+func (e *Engine) requestFieldsWithinLimit(body []byte, input []json.RawMessage) bool {
+	bytes := len(body)
+	for _, item := range input {
+		obj, _ := object(item)
+		if stringValue(obj["type"]) != "web_search_call" {
+			continue
+		}
+		var text string
+		if raw := obj["encrypted_content"]; len(raw) > 2 && json.Unmarshal(raw, &text) == nil && text != "" {
+			bytes -= len(raw) - 2
+		}
+	}
+	return bytes <= e.opts.MaxHistoryBytes
 }
 
 func (e *Engine) historyWithinLimit(history []json.RawMessage) bool {
@@ -859,7 +931,7 @@ func observeSearch(ctx context.Context, observer Observer, index int, item json.
 	return ctx.Err()
 }
 
-func (e *Engine) execute(ctx context.Context, call json.RawMessage, index int, observer Observer) (json.RawMessage, json.RawMessage, json.RawMessage, error) {
+func (e *Engine) execute(ctx context.Context, call json.RawMessage, index int, observer Observer, record webRecord) (json.RawMessage, json.RawMessage, json.RawMessage, error) {
 	obj, _ := object(call)
 	var argText string
 	var args map[string]json.RawMessage
@@ -975,6 +1047,12 @@ func (e *Engine) execute(ctx context.Context, call json.RawMessage, index int, o
 		return nil, nil, nil, err
 	}
 	publicItem["status"] = status
+	record.call, record.result = hiddenCall, toolOutput
+	searchContext, err := e.encodeSearchContext(publicID, record)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	publicItem["encrypted_content"] = searchContext
 	public, err = json.Marshal(publicItem)
 	if err != nil {
 		return nil, nil, nil, err
