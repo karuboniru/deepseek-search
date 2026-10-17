@@ -10,6 +10,7 @@ import (
 )
 
 // Options bounds work and in-memory conversation state. Zero values use defaults.
+// MaxRounds and MaxCalls accept -1 to disable their respective execution limits.
 type Options struct {
 	MaxRounds       int
 	MaxCalls        int
@@ -22,10 +23,10 @@ type Options struct {
 }
 
 func (o Options) defaults() Options {
-	if o.MaxRounds <= 0 {
+	if o.MaxRounds == 0 || o.MaxRounds < -1 {
 		o.MaxRounds = 8
 	}
-	if o.MaxCalls <= 0 {
+	if o.MaxCalls == 0 || o.MaxCalls < -1 {
 		o.MaxCalls = 16
 	}
 	if o.MaxStates <= 0 {

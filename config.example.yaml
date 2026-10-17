@@ -20,6 +20,7 @@ plugins:
       count: 5
       # Including webpage content can consume a large amount of context.
       need_content: false
+      # Omit for these defaults; set either value to 0 to disable that limit.
       max_rounds: 8
       max_calls: 16
       max_states: 128

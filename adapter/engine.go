@@ -40,7 +40,12 @@ type Engine struct {
 
 func NewEngine(searcher Searcher, opts Options) *Engine {
 	opts = opts.defaults()
-	return &Engine{searcher: searcher, opts: opts, states: newStateStore(opts.MaxStates, opts.MaxStates*opts.MaxCalls)}
+	cacheCalls := opts.MaxCalls
+	if cacheCalls < 0 {
+		// Unlimited execution must not make the fallback cache unbounded.
+		cacheCalls = 16
+	}
+	return &Engine{searcher: searcher, opts: opts, states: newStateStore(opts.MaxStates, opts.MaxStates*cacheCalls)}
 }
 
 // Run processes one public Responses request. The tenant key must identify the
@@ -208,7 +213,7 @@ func (e *Engine) RunObserved(ctx context.Context, tenant string, body []byte, mo
 	var publicOutput []json.RawMessage
 	usageTotals := make(map[string]int64)
 	callCount := 0
-	for round := 0; round < e.opts.MaxRounds; round++ {
+	for round := 0; e.opts.MaxRounds < 0 || round < e.opts.MaxRounds; round++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -295,7 +300,7 @@ func (e *Engine) RunObserved(ctx context.Context, tenant string, body []byte, mo
 			}
 			publicOutput = append(publicOutput, item)
 		}
-		if callCount+len(privateCalls) > e.opts.MaxCalls {
+		if e.opts.MaxCalls > 0 && callCount+len(privateCalls) > e.opts.MaxCalls {
 			return nil, errors.New("web_search call limit exceeded")
 		}
 		if round == 0 {

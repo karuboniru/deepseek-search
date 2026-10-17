@@ -101,6 +101,24 @@ explicitly warns that including webpage content can consume a large amount of
 context and recommends enabling it only when summaries are insufficient.
 Existing response and history size limits still apply.
 
+### Search execution budgets
+
+Omitting `max_rounds` and `max_calls` uses 8 model rounds and 16 search/page
+calls per client request. Set either field to `0` to disable that limit;
+positive values enforce a limit and negative configuration values are rejected.
+For unlimited rounds and calls:
+
+```yaml
+max_rounds: 0
+max_calls: 0
+```
+
+This does not disable history item/byte limits, upstream stream size limits,
+search rate limiting, or cancellation on client disconnect. The fallback search
+cache remains bounded (16 search slots per `max_states` when calls are unlimited).
+A model that continues searching may keep using upstream tokens and search calls
+until it finishes, the client cancels, or another limit is reached.
+
 ## Execution and context
 
 - Multiple searches per response and successive search/model rounds are

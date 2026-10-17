@@ -208,7 +208,7 @@ func configure(raw []byte) error {
 	if err := json.Unmarshal(raw, &request); err != nil {
 		return fmt.Errorf("decode plugin configuration: %w", err)
 	}
-	cfg := pluginConfig{APIKeyEnv: "DEEPSEEK"}
+	cfg := pluginConfig{APIKeyEnv: "DEEPSEEK", MaxRounds: 8, MaxCalls: 16}
 	if len(request.ConfigYAML) > 0 {
 		if err := yaml.Unmarshal(request.ConfigYAML, &cfg); err != nil {
 			return fmt.Errorf("decode plugin YAML: %w", err)
@@ -270,8 +270,15 @@ func configure(raw []byte) error {
 		if err != nil {
 			return errors.New("invalid DeepSeek client configuration")
 		}
+		maxRounds, maxCalls := cfg.MaxRounds, cfg.MaxCalls
+		if maxRounds == 0 {
+			maxRounds = -1
+		}
+		if maxCalls == 0 {
+			maxCalls = -1
+		}
 		runtime.engine = adapter.NewEngine(client, adapter.Options{
-			MaxRounds: cfg.MaxRounds, MaxCalls: cfg.MaxCalls,
+			MaxRounds: maxRounds, MaxCalls: maxCalls,
 			MaxStates: cfg.MaxStates, MaxHistoryItems: cfg.MaxHistoryItems,
 			MaxHistoryBytes:      cfg.MaxHistoryBytes,
 			OnSearchCacheRestore: logSearchCacheRestore,
