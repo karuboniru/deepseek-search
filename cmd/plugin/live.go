@@ -40,6 +40,18 @@ func liveObject(raw []byte) (map[string]json.RawMessage, error) {
 	}
 	return obj, nil
 }
+
+// Some host translators include an empty reasoning carrier in item.done but
+// omit it in response.completed. Normalize that optional field in both shapes.
+func normalizeLiveItem(item map[string]json.RawMessage) {
+	if liveString(item["type"]) == "reasoning" {
+		raw, ok := item["encrypted_content"]
+		if ok && (bytes.Equal(bytes.TrimSpace(raw), []byte(`""`)) || bytes.Equal(bytes.TrimSpace(raw), []byte("null"))) {
+			delete(item, "encrypted_content")
+		}
+	}
+}
+
 func liveString(raw json.RawMessage) string { var s string; _ = json.Unmarshal(raw, &s); return s }
 func liveJSON(value any) json.RawMessage    { raw, _ := json.Marshal(value); return raw }
 
@@ -230,6 +242,7 @@ func (l *liveResponse) deliver(item *liveItem, event map[string]json.RawMessage)
 		if err != nil {
 			return err
 		}
+		normalizeLiveItem(obj)
 		obj["id"] = liveJSON(item.id)
 		return l.reconcile(item, liveJSON(obj))
 	}
@@ -347,6 +360,7 @@ func (l *liveResponse) forward(item *liveItem, event map[string]json.RawMessage)
 		if err != nil {
 			return err
 		}
+		normalizeLiveItem(obj)
 		obj["id"] = liveJSON(item.id)
 		fields["item"] = liveJSON(obj)
 		item.current = fields["item"]
@@ -495,6 +509,7 @@ func (l *liveResponse) EndRound(raw []byte) ([]byte, error) {
 			return nil, errors.New("unclassified completed Responses item")
 		}
 		obj, _ := liveObject(rawItem)
+		normalizeLiveItem(obj)
 		obj["id"] = liveJSON(item.id)
 		output[index] = liveJSON(obj)
 		if item.private {

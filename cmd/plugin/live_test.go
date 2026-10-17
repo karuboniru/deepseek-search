@@ -303,3 +303,25 @@ func TestLiveItemIDsUniqueAcrossPublicRequests(t *testing.T) {
 		t.Fatalf("item IDs reused across responses: %v", ids)
 	}
 }
+
+func TestLiveReasoningEmptyCarrierEquivalentToOmission(t *testing.T) {
+	for _, carrier := range []string{`""`, `null`} {
+		h := newLiveHarness(t)
+		if err := h.live.BeginRound(); err != nil {
+			t.Fatal(err)
+		}
+		h.event(t, `{"type":"response.output_item.added","output_index":0,"item":{"id":"r","type":"reasoning","summary":[]}}`)
+		h.event(t, `{"type":"response.reasoning_summary_part.added","output_index":0,"item_id":"r","summary_index":0,"part":{"type":"summary_text","text":""}}`)
+		h.event(t, `{"type":"response.reasoning_summary_text.delta","output_index":0,"item_id":"r","summary_index":0,"delta":"Thinking"}`)
+		h.event(t, `{"type":"response.output_item.done","output_index":0,"item":{"id":"r","type":"reasoning","encrypted_content":`+carrier+`,"summary":[{"type":"summary_text","text":"Thinking"}]}}`)
+		result, err := h.live.EndRound([]byte(`{"status":"completed","output":[{"id":"r","type":"reasoning","summary":[{"type":"summary_text","text":"Thinking"}]}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		obj, _ := liveObject(result)
+		if err := h.live.Complete(liveFinal(obj["output"])); err != nil {
+			t.Fatal(err)
+		}
+		assertReasoningOutputPreserved(t, liveFinal(obj["output"]), reasoningEvents(t, []byte(h.all())))
+	}
+}
