@@ -57,6 +57,8 @@ jobs:
           fi
       - name: Build and package
         run: |
+          # Container steps and checkout may run with different ownership.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           version="dev-${GITHUB_SHA:0:12}"
           if [[ "$GITHUB_REF_TYPE" == tag ]]; then
             version="${GITHUB_REF_NAME#v}"
