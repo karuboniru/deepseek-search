@@ -16,7 +16,9 @@ plugins:
         - name: your-non-native-model
           # upstream: defaults to name; must resolve in the host model registry.
           # provider: optionally restrict the host provider selection.
+      # Defaults; the model may override these per search call.
       count: 5
+      # Including webpage content can consume a large amount of context.
       need_content: false
       max_rounds: 8
       max_calls: 16

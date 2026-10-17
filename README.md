@@ -77,6 +77,30 @@ Older hosts can execute the plugin when the client sends a search declaration,
 but cannot advertise its added capability. CLIProxyAPIHome direct plugin
 execution is currently unsupported; the extension does not advertise it there.
 
+### Per-search defaults and overrides
+
+`count` and `need_content` in the plugin configuration are defaults (5 and
+false when omitted). The model can optionally override either field in a
+single `action: "search"` call, for example:
+
+```json
+{"action":"search","query":"Go release notes","count":3,"need_content":true}
+```
+
+Omitted fields use the configuration defaults independently. Explicit
+`need_content: false` overrides a configured true. Overrides apply only to that
+call and do not change defaults for later searches, rounds, or conversations.
+When a call contains multiple `queries`, its options apply to each query;
+`count` is the per-query result count. Separate calls can choose different
+options. These fields do not apply to `open_page` or `find_in_page`.
+
+`count` must be an integer from 1 to 50; `need_content` must be a boolean.
+Invalid values (including null) become tool errors without issuing a search,
+so the model can correct its arguments. The model-facing tool description
+explicitly warns that including webpage content can consume a large amount of
+context and recommends enabling it only when summaries are insufficient.
+Existing response and history size limits still apply.
+
 ## Execution and context
 
 - Multiple searches per response and successive search/model rounds are

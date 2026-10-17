@@ -840,7 +840,7 @@ func rewriteTools(req map[string]json.RawMessage) (bool, error) {
 	return searchEnabled, nil
 }
 
-const searchToolDefinition = `{"type":"function","name":"__deepseek_web_search","description":"Search the web, open a result page, or find text in a page. Use action search with query or queries, open_page with url, or find_in_page with url and pattern.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["search","open_page","find_in_page"]},"query":{"type":"string"},"queries":{"type":"array","items":{"type":"string"},"maxItems":4},"url":{"type":"string"},"pattern":{"type":"string"}},"required":["action"]}}`
+const searchToolDefinition = `{"type":"function","name":"__deepseek_web_search","description":"Search the web, open a result page, or find text in a page. Use action search with query or queries, open_page with url, or find_in_page with url and pattern. For search, optional count and need_content override configured defaults for this call only. Including webpage content may consume a large amount of context; enable need_content only when summaries are insufficient.","parameters":{"type":"object","properties":{"action":{"type":"string","enum":["search","open_page","find_in_page"]},"query":{"type":"string"},"queries":{"type":"array","items":{"type":"string"},"maxItems":4},"url":{"type":"string"},"pattern":{"type":"string"},"count":{"type":"integer","minimum":1,"maximum":50,"description":"Optional for search only: number of results per query. Omit to use the configured default. Larger values can consume more context."},"need_content":{"type":"boolean","description":"Optional for search only: include webpage content in results. Enabling this may consume a large amount of context; use it only when summaries are insufficient. Omit to use the configured default; false explicitly requests summaries without webpage content."}},"required":["action"]}}`
 
 type savedWebRecord struct {
 	id     string
@@ -872,6 +872,13 @@ func (e *Engine) execute(ctx context.Context, call json.RawMessage, index int, o
 	action := stringValue(args["action"])
 	if action == "" {
 		action = "search"
+	}
+	var options SearchOptions
+	if searchErr == nil {
+		options, searchErr = parseSearchOptions(args)
+		if searchErr == nil && action != "search" && options.hasOverrides() {
+			searchErr = errors.New("count and need_content are only supported for search")
+		}
 	}
 	var queries []string
 	if searchErr == nil && action == "search" {
@@ -920,7 +927,7 @@ func (e *Engine) execute(ctx context.Context, call json.RawMessage, index int, o
 	case searchErr != nil:
 		// Return argument validation errors to the model as failed tool results.
 	case action == "search":
-		data, searchErr = e.searchQueries(ctx, queries)
+		data, searchErr = e.searchQueries(ctx, queries, options)
 	case action == "open_page" || action == "find_in_page":
 		url := strings.TrimSpace(stringValue(args["url"]))
 		if url == "" {
@@ -978,9 +985,9 @@ func (e *Engine) execute(ctx context.Context, call json.RawMessage, index int, o
 	return hiddenCall, toolOutput, public, nil
 }
 
-func (e *Engine) searchQueries(ctx context.Context, queries []string) (json.RawMessage, error) {
+func (e *Engine) searchQueries(ctx context.Context, queries []string, options SearchOptions) (json.RawMessage, error) {
 	if len(queries) == 1 {
-		return e.searcher.Search(ctx, queries[0])
+		return e.search(ctx, queries[0], options)
 	}
 	type searchResult struct {
 		Query  string          `json:"query"`
@@ -992,7 +999,7 @@ func (e *Engine) searchQueries(ctx context.Context, queries []string) (json.RawM
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		result, err := e.searcher.Search(ctx, query)
+		result, err := e.search(ctx, query, options)
 		if err != nil {
 			return nil, err
 		}

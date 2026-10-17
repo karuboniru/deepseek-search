@@ -70,10 +70,25 @@ func NewDeepSeekClient(opts ClientOptions) (*DeepSeekClient, error) {
 }
 
 func (c *DeepSeekClient) Search(ctx context.Context, query string) (json.RawMessage, error) {
+	return c.SearchWithOptions(ctx, query, SearchOptions{})
+}
+
+// SearchWithOptions applies per-call overrides without changing client defaults.
+func (c *DeepSeekClient) SearchWithOptions(ctx context.Context, query string, options SearchOptions) (json.RawMessage, error) {
+	if err := options.validate(); err != nil {
+		return nil, err
+	}
+	count, needContent := c.opts.Count, c.opts.NeedContent
+	if options.Count != nil {
+		count = *options.Count
+	}
+	if options.NeedContent != nil {
+		needContent = *options.NeedContent
+	}
 	if strings.TrimSpace(query) == "" || !utf8.ValidString(query) || utf8.RuneCountInString(query) > 128 {
 		return nil, errors.New("search query must contain 1 to 128 Unicode characters")
 	}
-	raw, err := c.request(ctx, "/v1/tools/search", map[string]any{"query": query, "count": c.opts.Count, "need_content": c.opts.NeedContent}, &c.searchGate)
+	raw, err := c.request(ctx, "/v1/tools/search", map[string]any{"query": query, "count": count, "need_content": needContent}, &c.searchGate)
 	if err != nil {
 		return nil, err
 	}
