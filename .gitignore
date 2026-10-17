@@ -1,0 +1,5 @@
+/build/
+/.env
+/config.local.yaml
+/dist/
+/.env.*

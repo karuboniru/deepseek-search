@@ -1,0 +1,26 @@
+# Merge this section into the host configuration. Models must already be
+# registered in CLIProxyAPI. Use exact public model names, not provider names.
+plugins:
+  enabled: true
+  dir: /absolute/path/to/deepseek-search/build
+  configs:
+    deepseek-search:
+      enabled: true
+      priority: 100
+      # Set a key directly here, or leave empty to use api_key_env.
+      # A non-empty api_key takes precedence over the environment variable.
+      api_key: ""
+      api_key_env: DEEPSEEK
+      base_url: https://api.deepseek.com
+      models:
+        - name: your-non-native-model
+          # upstream: defaults to name; must resolve in the host model registry.
+          # provider: optionally restrict the host provider selection.
+      count: 5
+      need_content: false
+      max_rounds: 8
+      max_calls: 16
+      max_states: 128
+      max_history_items: 256
+      max_history_bytes: 4194304
+      max_response_bytes: 8388608

@@ -1,0 +1,110 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    container: golang:1.26-bookworm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            cc: gcc
+          - arch: arm64
+            cc: aarch64-linux-gnu-gcc
+    env:
+      CGO_ENABLED: '1'
+      GOOS: linux
+      GOARCH: ${{ matrix.arch }}
+      CC: ${{ matrix.cc }}
+      GOTOOLCHAIN: local
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install packaging and cross-compilation tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends make zip binutils
+          if [[ "$GOARCH" == arm64 ]]; then
+            apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
+          fi
+      - name: Check formatting and module integrity
+        run: |
+          test -z "$(gofmt -l adapter cmd)"
+          go mod download
+          go mod verify
+      - name: Test
+        run: |
+          if [[ "$GOARCH" == arm64 ]]; then
+            go test -exec 'qemu-aarch64 -L /usr/aarch64-linux-gnu' ./...
+          else
+            go test -race ./...
+          fi
+      - name: Build and package
+        run: |
+          version="dev-${GITHUB_SHA:0:12}"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          [[ "$version" =~ ^[[:alnum:]][[:alnum:].+_-]*$ ]]
+          make package VERSION="$version" ARCH="$GOARCH"
+          (cd dist && sha256sum --check checksums.txt)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: |
+            dist/*.zip
+            dist/checksums.txt
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: linux-*
+          path: dist
+          merge-multiple: true
+      - name: Verify assets and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          version="${RELEASE_TAG#v}"
+          assets=("deepseek-search_${version}_linux_amd64.zip" "deepseek-search_${version}_linux_arm64.zip")
+          sha256sum "${assets[@]}" > checksums.txt
+          sha256sum --check checksums.txt
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" checksums.txt --clobber
+          else
+            options=()
+            if [[ "$version" == *-* ]]; then
+              options+=(--prerelease)
+            fi
+            gh release create "$RELEASE_TAG" "${assets[@]}" checksums.txt \
+              --verify-tag --generate-notes --title "$RELEASE_TAG" "${options[@]}"
+          fi
