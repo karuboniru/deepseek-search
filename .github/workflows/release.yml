@@ -12,20 +12,28 @@ permissions:
 
 jobs:
   build:
-    name: Linux ${{ matrix.arch }}
+    name: Cross build ${{ matrix.os }} ${{ matrix.arch }}
     runs-on: ubuntu-24.04
     container: golang:1.26-bookworm
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: amd64
+          - os: linux
+            arch: amd64
             cc: gcc
-          - arch: arm64
+          - os: linux
+            arch: arm64
             cc: aarch64-linux-gnu-gcc
+          - os: windows
+            arch: amd64
+            cc: x86_64-w64-mingw32-clang
+          - os: windows
+            arch: arm64
+            cc: aarch64-w64-mingw32-clang
     env:
       CGO_ENABLED: '1'
-      GOOS: linux
+      GOOS: ${{ matrix.os }}
       GOARCH: ${{ matrix.arch }}
       CC: ${{ matrix.cc }}
       GOTOOLCHAIN: local
@@ -39,44 +47,146 @@ jobs:
       - name: Install packaging and cross-compilation tools
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends make zip binutils
-          if [[ "$GOARCH" == arm64 ]]; then
+          apt-get install -y --no-install-recommends make zip binutils curl xz-utils ca-certificates
+          if [[ "$GOOS/$GOARCH" == linux/arm64 ]]; then
             apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
+          fi
+          if [[ "$GOOS" == windows ]]; then
+            archive=llvm-mingw-20261006-ucrt-ubuntu-22.04-x86_64.tar.xz
+            curl --fail --location --retry 3 "https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/$archive" -o /tmp/llvm-mingw.tar.xz
+            echo '5f9c6ed95b2d4bdb2869a488c5fd5857fbdabcf288a0aa3eb1da43f6a08d8ab4  /tmp/llvm-mingw.tar.xz' | sha256sum --check
+            mkdir -p /opt/llvm-mingw
+            tar -xJf /tmp/llvm-mingw.tar.xz -C /opt/llvm-mingw --strip-components=1
+            echo /opt/llvm-mingw/bin >> "$GITHUB_PATH"
           fi
       - name: Check formatting and module integrity
         run: |
           test -z "$(gofmt -l adapter cmd)"
           go mod download
           go mod verify
-      - name: Test
+      - name: Test Linux or compile Windows tests
         run: |
-          if [[ "$GOARCH" == arm64 ]]; then
-            go test -exec 'qemu-aarch64 -L /usr/aarch64-linux-gnu' ./...
-          else
-            go test -race ./...
-          fi
+          case "$GOOS/$GOARCH" in
+            linux/amd64) go test -race ./... ;;
+            linux/arm64) go test -exec 'qemu-aarch64 -L /usr/aarch64-linux-gnu' ./... ;;
+            windows/*)
+              mkdir -p build/runtime
+              go test -c -o build/runtime/adapter.test.exe ./adapter
+              go test -c -o build/runtime/plugin.test.exe ./cmd/plugin
+              "$CC" -Wall -Wextra -Werror scripts/abi-smoke.c -o build/runtime/abi-smoke.exe
+              ;;
+          esac
       - name: Build and package
         run: |
-          # Container steps and checkout may run with different ownership.
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           version="dev-${GITHUB_SHA:0:12}"
-          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
-            version="${GITHUB_REF_NAME#v}"
-          fi
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then version="${GITHUB_REF_NAME#v}"; fi
           [[ "$version" =~ ^[[:alnum:]][[:alnum:].+_-]*$ ]]
-          make package VERSION="$version" ARCH="$GOARCH"
+          make package VERSION="$version" TARGET_OS="$GOOS" ARCH="$GOARCH"
           (cd dist && sha256sum --check checksums.txt)
+          if [[ "$GOOS" == windows ]]; then
+            cp build/deepseek-search.dll build/runtime/
+          else
+            "$CC" -Wall -Wextra -Werror scripts/abi-smoke.c -ldl -o build/abi-smoke
+            if [[ "$GOARCH" == arm64 ]]; then
+              qemu-aarch64 -L /usr/aarch64-linux-gnu build/abi-smoke ./build/deepseek-search.so
+            else
+              build/abi-smoke ./build/deepseek-search.so
+            fi
+          fi
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: linux-${{ matrix.arch }}
-          path: |
-            dist/*.zip
-            dist/checksums.txt
+          name: package-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*.zip
           if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: matrix.os == 'windows'
+        with:
+          name: windows-runtime-${{ matrix.arch }}
+          path: build/runtime/*
+          if-no-files-found: error
+
+  macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: macos-15-intel
+          - arch: arm64
+            runner: macos-15
+    env:
+      CGO_ENABLED: '1'
+      GOOS: darwin
+      GOARCH: ${{ matrix.arch }}
+      CC: clang
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+      GOTOOLCHAIN: local
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.26.x'
+          cache: true
+      - name: Test and check modules
+        run: |
+          test -z "$(gofmt -l adapter cmd)"
+          go mod download
+          go mod verify
+          go test -race ./...
+      - name: Build, package, and load dylib
+        run: |
+          version="dev-${GITHUB_SHA:0:12}"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then version="${GITHUB_REF_NAME#v}"; fi
+          [[ "$version" =~ ^[[:alnum:]][[:alnum:].+_-]*$ ]]
+          make package VERSION="$version" TARGET_OS=darwin ARCH="$GOARCH"
+          (cd dist && shasum -a 256 --check checksums.txt)
+          clang -Wall -Wextra -Werror scripts/abi-smoke.c -o build/abi-smoke
+          build/abi-smoke ./build/deepseek-search.dylib
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: package-darwin-${{ matrix.arch }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  windows-test:
+    name: Test Windows ${{ matrix.arch }} binaries
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: windows-2025
+          - arch: arm64
+            runner: windows-11-arm
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: windows-runtime-${{ matrix.arch }}
+          path: runtime
+      - name: Run target tests and load DLL
+        shell: pwsh
+        run: |
+          Set-Location runtime
+          & .\adapter.test.exe -test.v -test.timeout=5m
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\plugin.test.exe -test.v -test.timeout=5m
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\abi-smoke.exe .\deepseek-search.dll
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   release:
     name: Publish release
-    needs: build
+    needs: [build, macos, windows-test]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
@@ -84,10 +194,10 @@ jobs:
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: linux-*
+          pattern: package-*
           path: dist
           merge-multiple: true
-      - name: Verify assets and publish
+      - name: Verify all six assets and publish
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -97,16 +207,21 @@ jobs:
           set -euo pipefail
           cd dist
           version="${RELEASE_TAG#v}"
-          assets=("deepseek-search_${version}_linux_amd64.zip" "deepseek-search_${version}_linux_arm64.zip")
+          assets=()
+          for os in linux darwin windows; do
+            for arch in amd64 arm64; do
+              asset="deepseek-search_${version}_${os}_${arch}.zip"
+              test -s "$asset"
+              assets+=("$asset")
+            done
+          done
           sha256sum "${assets[@]}" > checksums.txt
           sha256sum --check checksums.txt
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" "${assets[@]}" checksums.txt --clobber
           else
             options=()
-            if [[ "$version" == *-* ]]; then
-              options+=(--prerelease)
-            fi
+            if [[ "$version" == *-* ]]; then options+=(--prerelease); fi
             gh release create "$RELEASE_TAG" "${assets[@]}" checksums.txt \
               --verify-tag --generate-notes --title "$RELEASE_TAG" "${options[@]}"
           fi

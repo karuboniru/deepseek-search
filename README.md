@@ -23,29 +23,58 @@ make container-build
 make container-test
 ```
 
-The Linux artifact is `build/deepseek-search.so`. Build on the target platform
-for macOS/Windows and use its appropriate shared-library extension. A library
-built in the Debian Go image requires glibc; an Alpine host needs a musl build.
+The artifact is `build/deepseek-search.so` on Linux,
+`build/deepseek-search.dylib` on macOS, or `build/deepseek-search.dll` on Windows.
+`make build` selects the Go target OS and architecture. For cross-compilation,
+provide a matching C toolchain, for example:
+
+```sh
+make package TARGET_OS=windows ARCH=arm64 CC=aarch64-w64-mingw32-clang VERSION=0.4.2
+```
+
+A library built in the Debian Go image requires glibc; an Alpine host needs a
+musl build.
 The generated C header is not required to load the plugin.
 
 ## Release distribution
 
-GitHub Actions tests and builds Linux `amd64` and `arm64` on main pushes, pull
-requests, and manual runs. Pushing a version tag such as `v0.1.0` additionally
-creates a GitHub Release after both architectures pass. The release assets use
-the CLIProxyAPI plugin-store convention:
+GitHub Actions builds Linux, macOS (`darwin`), and Windows for both `amd64` and
+`arm64` on main pushes, PRs, and manual runs. Pushing a version tag such as
+`v0.4.2` publishes a release only after all six builds and runtime checks pass.
 
-- `deepseek-search_0.1.0_linux_amd64.zip`
-- `deepseek-search_0.1.0_linux_arm64.zip`
-- `checksums.txt` containing SHA-256 hashes for both archives.
+- Linux builds use Debian Bookworm; arm64 tests and library loading run under QEMU.
+- Windows builds cross-compile on Linux using a pinned, SHA-256-verified
+  LLVM-MinGW UCRT toolchain. The compiled tests and actual DLL are then exercised
+  on Windows amd64 and Windows arm64 runners.
+- macOS builds run tests and load the dylib on native Intel and Apple Silicon
+  runners with a macOS 12 deployment target.
+- Packaging checks each binary's format, architecture, and all four exported
+  C ABI functions. A C smoke test loads the library, initializes the ABI,
+  registers the disabled plugin, calls its identifier, and releases its buffers.
 
-Each ZIP contains `deepseek-search.so` at its root, plus the license, README,
-and configuration example. These Linux builds require glibc >= 2.34; they do
-not target musl/Alpine. Verify the downloaded archives with
-`sha256sum -c checksums.txt`. For manual installation, place the library in
-`<plugins.dir>/linux/<architecture>/deepseek-search.so` and configure the plugin
-as shown below. Non-tag runs keep the packages as Actions artifacts and do not
-publish a release. Publishing release assets does not automatically add this
+The plugin-store assets are named:
+
+```text
+deepseek-search_<version>_linux_amd64.zip
+deepseek-search_<version>_linux_arm64.zip
+deepseek-search_<version>_darwin_amd64.zip
+deepseek-search_<version>_darwin_arm64.zip
+deepseek-search_<version>_windows_amd64.zip
+deepseek-search_<version>_windows_arm64.zip
+checksums.txt
+```
+
+Each ZIP contains exactly one platform library at its root, plus the license,
+README, and configuration example. `checksums.txt` covers all six ZIPs in
+sha256sum format. Linux builds require glibc >= 2.34 and do not target musl/Alpine;
+macOS builds target macOS 12 or later; Windows builds use UCRT and target Windows
+10 or later (ARM64 runtime tests use Windows 11). macOS libraries are not
+Developer ID signed or notarized.
+
+For manual installation, place the matching library in
+`<plugins.dir>/<goos>/<goarch>/deepseek-search.<extension>` and configure the
+plugin as shown below. Non-tag runs keep packages as Actions artifacts.
+Publishing release assets does not automatically add this
 repository to a plugin-store registry.
 
 The packaging follows the host's `internal/pluginstore` contract and the
