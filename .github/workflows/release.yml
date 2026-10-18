@@ -177,9 +177,9 @@ jobs:
         shell: pwsh
         run: |
           Set-Location runtime
-          & .\adapter.test.exe -test.v -test.timeout=5m
+          & .\adapter.test.exe "-test.v" "-test.timeout=5m"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & .\plugin.test.exe -test.v -test.timeout=5m
+          & .\plugin.test.exe "-test.v" "-test.timeout=5m"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & .\abi-smoke.exe .\deepseek-search.dll
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
